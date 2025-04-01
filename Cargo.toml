@@ -10,4 +10,5 @@ wgpu = "0.19"  # Check for latest version
 pollster = "0.3"
 env_logger = "0.11" # Optional: for wgpu logging
 bytemuck = { version = "1.14", features = ["derive"] } # For converting structs to bytes for buffers
-glam = "0.25" # Good vector math library, useful for positions/velocities
+glam = "0.25"
+rayon = "1.10.0" # Good vector math library, useful for positions/velocities

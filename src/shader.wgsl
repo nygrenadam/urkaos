@@ -65,9 +65,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      }
 
     // Optional: Smooth the edge slightly for anti-aliasing
-       // let smooth_edge = 1.0 - smoothstep(0.95, 1.0, dist);
-     //return vec4<f32>(in.color.rgb, in.color.a * smooth_edge);
+       let smooth_edge = 1.0 - smoothstep(0.95, 1.0, dist);
+     return vec4<f32>(in.color.rgb, in.color.a * smooth_edge);
 
      // Return the solid color passed from the vertex shader
-     return in.color;
+     //return in.color;
 }
