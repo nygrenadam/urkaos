@@ -63,22 +63,21 @@ impl SimulationConfig {
 
         // Plant Config
         config.plant.min_lifetime = 5.0;
-        config.plant.max_lifetime = 15.0;
+        config.plant.max_lifetime = 75.0;
 
-        config.plant.base_growth_rate = 1.2;
+        config.plant.base_growth_rate = 1.0;
 
         config.plant.movement_speed_factor = 0.0;
         config.plant.base_color = [0.1, 0.7, 0.1, 1.0]; // Green
-        config.plant.clustering_radius_factor = 2.0; // Plants cluster slightly
-        config.plant.aging_rate_when_eaten = 10.0; // Age faster when eaten
-        // Add potential plant clustering spawn boost if desired
-        // config.plant.eating_spawn_boost_factor = 1.5; // Renamed conceptually
+        config.plant.clustering_radius_factor = 8.0; // Plants cluster slightly
+        config.plant.aging_rate_when_eaten = 2.0; // Age faster when eaten
+
 
         // Fish Config
         config.fish.min_lifetime = 5.0;
         config.fish.max_lifetime = 15.0;
 
-        config.fish.base_growth_rate = 1.01;
+        config.fish.base_growth_rate = 1.21;
 
         config.fish.movement_speed_factor = 2.0;
         config.fish.max_turn_angle_per_sec = PI * 2.0; // Can turn quickly
@@ -100,16 +99,16 @@ impl SimulationConfig {
 
         config.bug.base_growth_rate = 0.8;
 
-        config.bug.movement_speed_factor = 1.0;
+        config.bug.movement_speed_factor = 0.05;
         config.bug.max_turn_angle_per_sec = PI / 3.0; // Turns less sharply than fish
 
         config.bug.perception_radius_factor = 1.0; // Slower than fish
         config.bug.eating_radius_factor = 2.0;
-        config.bug.eating_spawn_boost_factor = 5.0; // Reproduces fast when eating
+        config.bug.eating_spawn_boost_factor = 1.3; // Reproduces fast when eating
 
         config.bug.influence_plant = 0.5; // Attracted to plants
         config.bug.influence_fish = -0.5; //
-        config.bug.influence_bug = -0.8; // Avoids bugs
+        config.bug.influence_bug = 0.8; // Avoids bugs
         config.bug.influence_weight = 0.8;
 
         config.bug.base_color = [0.9, 0.6, 0.1, 1.0]; // Orange/Brown
