@@ -1,73 +1,89 @@
-// src/shader.wgsl
+// Metaball/SDF Shader (Vertex Buffer Version) - Optimized
+
+// === Uniforms (Global Settings) ===
+struct GlobalUniforms {
+    screen_resolution: vec2<f32>,
+    iso_level: f32,
+    smoothness: f32,
+    background_color: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u_globals: GlobalUniforms;
+
+// === Organism Data (Storage Buffer) ===
+struct OrganismGpuData {
+    world_position: vec2<f32>,
+    radius: f32,
+    _padding1: f32, // Keep padding for alignment
+    color: vec4<f32>,
+};
+@group(1) @binding(0) var<storage, read> organisms_buffer: array<OrganismGpuData>;
+@group(1) @binding(1) var<uniform> u_organism_count: u32;
+
+
+// === Vertex Shader === (No changes needed or allowed)
 
 struct VertexInput {
-    @location(0) position: vec2<f32>, // Quad vertex position (-1 to 1)
-};
-
-struct InstanceInput {
-     @location(1) world_position: vec2<f32>, // Center of the organism in pixel coords
-     @location(2) radius: f32,               // Radius in pixel coords
-     @location(3) color: vec4<f32>,          // RGBA color
+    @location(0) position: vec2<f32>, // NDC position from buffer
 };
 
 struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>, // Output position in clip space (-1 to 1)
-    @location(0) local_pos: vec2<f32>, // Pass local quad coord [-1, 1] to frag
-    @location(1) color: vec4<f32>,     // Pass color to frag
+    @builtin(position) clip_position: vec4<f32>,
 };
-
-struct Uniforms {
-    screen_resolution: vec2<f32>, // width, height of the window in pixels
-};
-// Uniform buffer bound at group 0, binding 0
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
 
 @vertex
-fn vs_main(
-    model: VertexInput,     // Input from the vertex buffer (quad vertices)
-    instance: InstanceInput // Input from the instance buffer (organism data)
-) -> VertexOutput {
-    // 1. Scale the quad vertex (initially -1 to 1) by the instance radius.
-    // This gives us the vertex position relative to the instance center, in pixels.
-    let scaled_local_pos = model.position * instance.radius;
-
-    // 2. Add the instance's world position (in pixels) to get the final world position of the vertex.
-    let world_pos = scaled_local_pos + instance.world_position;
-
-    // 3. Convert world pixel coordinates (origin top-left) to Normalized Device Coordinates (NDC) (-1 to 1, origin center).
-    // NDC.x = (world_pos.x / screen_width) * 2.0 - 1.0
-    // NDC.y = (world_pos.y / screen_height) * 2.0 - 1.0
-    // However, NDC Y increases upwards, while screen Y increases downwards. So we need to flip Y.
-    // NDC.y = 1.0 - (world_pos.y / screen_height) * 2.0
-    let zero_to_two = world_pos / uniforms.screen_resolution * 2.0;
-    let inverted_y = vec2(zero_to_two.x, -zero_to_two.y); // Scale to [0, 2] range, flip Y
-    let ndc_pos = inverted_y - vec2(1.0, -1.0); // Translate to [-1, 1] NDC range
-
+fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = vec4<f32>(ndc_pos, 0.0, 1.0); // Z = 0, W = 1
-    out.local_pos = model.position; // Pass the original quad vertex position (-1 to 1)
-    out.color = instance.color;     // Pass the instance color through
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
     return out;
 }
 
+
+// === Fragment Shader === (Optimized Version)
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-     // Calculate distance from the center of the quad (0,0 in local_pos)
-     // local_pos is interpolated across the quad's surface.
-     let dist = length(in.local_pos);
+fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+    let screen_coord = vec2<f32>(
+        frag_coord.x,
+        u_globals.screen_resolution.y - frag_coord.y
+    );
 
-     // Discard fragment if its distance from the center is > 1.0
-     // (since local_pos ranges from -1 to 1, length goes from 0 to sqrt(2),
-     // but we only care about the distance relative to the circle's edge at 1.0)
-     if dist > 1.0 {
-         discard; // Don't draw this pixel
-     }
+    var total_field: f32 = 0.0;
+    var accumulated_color: vec4<f32> = vec4(0.0);
+    let num_orgs = u_organism_count;
 
-    // Optional: Smooth the edge slightly for anti-aliasing
-       let smooth_edge = 1.0 - smoothstep(0.1, 0.9, dist);
-     return vec4<f32>(in.color.rgb, in.color.a * smooth_edge);
+    for (var i: u32 = 0u; i < num_orgs; i = i + 1u) {
+        let org = organisms_buffer[i];
+        let radius = org.radius;
+        let radius_sq = radius * radius;
+        if (radius_sq <= 0.0) { continue; }
 
-     // Return the solid color passed from the vertex shader
-     //return in.color;
+        let dist_vec = screen_coord - org.world_position;
+        let dist_sq = dot(dist_vec, dist_vec);
+        if (dist_sq >= radius_sq) { continue; }
+
+        let rcp_radius_sq = 1.0 / radius_sq;
+        let normalized_dist_sq = dist_sq * rcp_radius_sq;
+        let h = max(0.0, 1.0 - normalized_dist_sq);
+        let field_contrib = h * h;
+
+        total_field += field_contrib;
+        accumulated_color += org.color * field_contrib;
+    }
+
+    let safe_total_field = max(total_field, 0.0001);
+    let final_rgb = accumulated_color.rgb / safe_total_field;
+
+    let alpha = smoothstep(
+        u_globals.iso_level - u_globals.smoothness,
+        u_globals.iso_level + u_globals.smoothness,
+        total_field
+    );
+
+    let final_color = mix(
+        u_globals.background_color,
+        vec4(final_rgb, 1.0),
+        alpha
+    );
+
+    return final_color;
 }

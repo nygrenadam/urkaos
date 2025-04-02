@@ -1,14 +1,21 @@
 [package]
 name = "urkaos"
 version = "0.1.0"
-edition = "2021" # Use 2021 edition for newer features
+edition = "2024"
 
 [dependencies]
 rand = "0.8.5"
 winit = "0.29" # Check for latest version
-wgpu = "0.19"  # Check for latest version
+wgpu = "0.19.4"  # Check for latest version
 pollster = "0.3"
 env_logger = "0.11" # Optional: for wgpu logging
 bytemuck = { version = "1.14", features = ["derive"] } # For converting structs to bytes for buffers
 glam = "0.25"
-rayon = "1.10.0" # Good vector math library, useful for positions/velocities
+log = "0.4.27"
+
+
+[profile.dev]
+opt-level = 1 # Enable some optimizations in debug builds
+
+[profile.release]
+opt-level = 3 # Maximize optimizations for release
