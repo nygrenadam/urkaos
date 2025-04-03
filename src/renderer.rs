@@ -71,9 +71,9 @@ pub struct Renderer<'a> {
 }
 
 // --- Constants for Metaballs (Tunable) ---
-const METABALL_ISO_LEVEL: f32 = 0.95;
+const METABALL_ISO_LEVEL: f32 = 1.2;
 const METABALL_SMOOTHNESS: f32 = 0.95;
-const VISUAL_RADIUS_MULTIPLIER: f32 = 1.2;
+const VISUAL_RADIUS_MULTIPLIER: f32 = 2.8;
 
 // --- NEW: Constants for Buffer Allocation ---
 // Add some headroom beyond MAX_ORGANISMS for safety/flexibility

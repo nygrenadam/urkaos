@@ -114,11 +114,13 @@ impl SimulationConfig {
         // --- Plant Config ---
         config.plant.min_lifetime = 25.0;
         config.plant.max_lifetime = 45.0;
-        config.plant.base_growth_rate = 1.1;
+        config.plant.base_growth_rate = 2.9;
         config.plant.movement_speed_factor = 0.0; // Stays 0
         config.plant.base_color = [0.1, 0.7, 0.1, 1.0]; // Green
         config.plant.clustering_radius_factor = 64.0;
-        config.plant.aging_rate_when_eaten = 1.4;
+        config.plant.aging_rate_when_eaten = 1.2;
+        config.plant.eating_spawn_boost_factor_fish = 2.4;
+
         config.plant.min_radius = 5.0;
         config.plant.max_radius = 6.0;
         config.plant.organism_min_pushaway_radius = 4.0;
@@ -126,22 +128,22 @@ impl SimulationConfig {
         // DNA rates for Plant
         config.plant.min_dna_mutation_rate = 0.01; // 1% min
         config.plant.max_dna_mutation_rate = 0.08; // 8% max
-        config.plant.current_dna_mutation_rate = 0.00006; // Start value
+        config.plant.current_dna_mutation_rate = 0.006; // Start value
         config.plant.min_dna_spawn_mutation_rate = 0.0005; // 0.05% min
-        config.plant.max_dna_spawn_mutation_rate = 0.01; // 1% max
-        config.plant.current_dna_spawn_mutation_rate = 0.0015; // Start value
+        config.plant.max_dna_spawn_mutation_rate = 0.1; // 1% max
+        config.plant.current_dna_spawn_mutation_rate = 0.015; // Start value
 
         // --- Fish Config ---
         config.fish.min_lifetime = 15.0;
         config.fish.max_lifetime = 35.0;
-        config.fish.base_growth_rate = 2.55;
-        config.fish.movement_speed_factor = 4.3;
+        config.fish.base_growth_rate = 3.55;
+        config.fish.movement_speed_factor = 8.3;
         config.fish.max_turn_angle_per_sec = PI * 2.0;
         config.fish.perception_radius_factor = 16.0;
         config.fish.aging_rate_when_eaten = 4.0;
         config.fish.eating_radius_factor = 5.5;
         config.fish.influence_plant = 0.1;
-        config.fish.influence_fish = 0.00000005;
+        config.fish.influence_fish = -0.005;
         config.fish.influence_bug = -0.8;
         config.fish.influence_offspring = 0.9; //
         config.fish.influence_weight = 0.8;
@@ -153,9 +155,9 @@ impl SimulationConfig {
         // DNA rates for Fish
         config.fish.min_dna_mutation_rate = 0.01; // 1% min
         config.fish.max_dna_mutation_rate = 0.12; // 12% max
-        config.fish.current_dna_mutation_rate = 0.00005; // Start value
+        config.fish.current_dna_mutation_rate = 0.005; // Start value
         config.fish.min_dna_spawn_mutation_rate = 0.001; // 0.1% min
-        config.fish.max_dna_spawn_mutation_rate = 0.05; // 5% max
+        config.fish.max_dna_spawn_mutation_rate = 0.5; // 5% max
         config.fish.current_dna_spawn_mutation_rate = 0.01; //
 
         // --- Bug Config ---
