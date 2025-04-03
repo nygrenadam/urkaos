@@ -23,7 +23,7 @@ use winit::{
 };
 
 // --- Constants for main loop ---
-const MAX_UPDATES_PER_FRAME: u32 = 1;
+const MAX_UPDATES_PER_FRAME: u32 = 5;
 const MAX_ACCUMULATED_TIME_CLAMP: f32 = MAX_UPDATES_PER_FRAME as f32 * FIXED_TIMESTEP;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

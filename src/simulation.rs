@@ -5,8 +5,11 @@ use crate::constants::*;
 use crate::utils::mutate_color;
 // Import helpers
 use glam::{Vec2, Vec4};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+// --- Use thread_rng for parallel random generation ---
+// REMOVED: unused SliceRandom
+use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
+// --- NEW: Import Rayon ---
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
@@ -43,16 +46,21 @@ pub struct Organism {
     pub lifetime: f32,
     pub growth_rate: f32,
     pub color: Vec4,
-    pub radius: f32, // This radius is used for simulation logic
+    pub radius: f32, // This radius is used for simulation logic (Globally Scaled)
     pub config: OrganismConfig,
 }
 
 pub type GridKey = (i32, i32);
-pub type SimRng = StdRng;
+// --- Change SimRng to be Send + Sync if needed globally, but we'll use thread_rng mostly ---
+// pub type SimRng = StdRng;
+pub type SimRng = StdRng; // Keep main RNG for seeding if needed, but use thread_rng in parallel loops
+
+// --- NEW: Constant for push-away force magnitude ---
+const PUSH_AWAY_FORCE_MAGNITUDE: f32 = 20.0;
 
 pub struct SimulationState {
     pub organisms: Vec<Organism>,
-    rng: SimRng,
+    rng: SimRng, // Main RNG for initialization/restart
     window_size: PhysicalSize<u32>,
     speed_multiplier: f32,
     is_paused: bool,
@@ -66,7 +74,7 @@ pub struct SimulationState {
     removal_indices_buffer: Vec<usize>,
     removal_indices_set: HashSet<usize>, // Also reuse hashset
     interaction_radii_buffer: Vec<InteractionRadii>, // Reuse radii buffer
-    new_velocities_buffer: Vec<Option<Vec2>>,
+    // REMOVED: new_velocities_buffer (will be part of collected results)
     // Renamed for clarity: This accumulates the aging *rate* to apply later
     accumulated_aging_rate_buffer: Vec<f32>,
     plant_is_clustered_buffer: Vec<bool>,
@@ -78,12 +86,27 @@ pub struct SimulationState {
     gpu_grid_offsets: Vec<[u32; 2]>, // [offset, count] for each cell into gpu_grid_indices
 }
 
+// --- NEW: Structure to hold results from the parallel calculation phase ---
+#[derive(Debug, Default)]
+struct OrganismCalculationResult {
+    index: usize, // Index of the organism this result is for
+    new_velocity: Option<Vec2>,
+    // List of prey affected by this organism eating them: (prey_index, aging_rate_to_apply)
+    prey_aging_effects: Vec<(usize, f32)>,
+    // Max spawn boost factor obtained by THIS organism from eating prey
+    spawn_boost_obtained: f32,
+    // Clustering status for THIS organism (if plant)
+    is_clustered: bool,
+}
+
 // Helper struct for pre-calculated radii (used in simulation logic)
 #[derive(Default, Clone, Copy)] // Add Default/Clone/Copy for easy vec resizing
 struct InteractionRadii {
     perception_sq: f32,
     eating_sq: f32,
     clustering_sq: f32,
+    // --- NEW: Squared push-away radius ---
+    pushaway_sq: f32,
 }
 
 impl SimulationState {
@@ -92,7 +115,7 @@ impl SimulationState {
         let grid_cell_size = avg_radius * GRID_CELL_SIZE_FACTOR;
         let grid_width = (window_size.width as f32 / grid_cell_size).ceil() as i32;
         let grid_height = (window_size.height as f32 / grid_cell_size).ceil() as i32;
-        let num_grid_cells = (grid_width * grid_height) as usize;
+        let num_grid_cells = (grid_width * grid_height).max(1) as usize; // Ensure non-zero
 
         let initial_capacity =
             (INITIAL_PLANT_COUNT + INITIAL_FISH_COUNT + INITIAL_BUG_COUNT).max(256);
@@ -114,8 +137,7 @@ impl SimulationState {
             removal_indices_buffer: Vec::with_capacity(removal_capacity),
             removal_indices_set: HashSet::with_capacity(removal_capacity),
             interaction_radii_buffer: Vec::with_capacity(initial_capacity),
-            new_velocities_buffer: Vec::with_capacity(initial_capacity),
-            // Renamed buffer initialization
+            // REMOVED: new_velocities_buffer initialization
             accumulated_aging_rate_buffer: Vec::with_capacity(initial_capacity),
             plant_is_clustered_buffer: Vec::with_capacity(initial_capacity),
             eating_boost_buffer: Vec::with_capacity(initial_capacity),
@@ -131,9 +153,12 @@ impl SimulationState {
         self.organisms.clear();
         let total_initial_count = INITIAL_PLANT_COUNT + INITIAL_FISH_COUNT + INITIAL_BUG_COUNT;
         self.organisms.reserve(total_initial_count.max(100));
+        // Use a local RNG derived from the main one for initialization consistency
+        let mut local_rng =
+            SimRng::from_rng(&mut self.rng).unwrap_or_else(|_| SimRng::from_entropy());
         for _ in 0..INITIAL_PLANT_COUNT {
             self.organisms.push(Self::create_organism(
-                &mut self.rng,
+                &mut local_rng, // Use local RNG
                 self.window_size,
                 OrganismType::Plant,
                 &self.config,
@@ -141,7 +166,7 @@ impl SimulationState {
         }
         for _ in 0..INITIAL_FISH_COUNT {
             self.organisms.push(Self::create_organism(
-                &mut self.rng,
+                &mut local_rng, // Use local RNG
                 self.window_size,
                 OrganismType::Fish,
                 &self.config,
@@ -149,7 +174,7 @@ impl SimulationState {
         }
         for _ in 0..INITIAL_BUG_COUNT {
             self.organisms.push(Self::create_organism(
-                &mut self.rng,
+                &mut local_rng, // Use local RNG
                 self.window_size,
                 OrganismType::Bug,
                 &self.config,
@@ -158,8 +183,10 @@ impl SimulationState {
         // OPTIMIZATION: Ensure buffer capacities match initial organisms
         self.resize_internal_buffers(self.organisms.len());
         // --- NEW: Ensure GPU grid offset buffer has correct size ---
-        let num_grid_cells = (self.grid_width * self.grid_height) as usize;
-        self.gpu_grid_offsets.resize(num_grid_cells, [0, 0]);
+        let num_grid_cells = (self.grid_width * self.grid_height).max(1) as usize;
+        if self.gpu_grid_offsets.len() != num_grid_cells {
+            self.gpu_grid_offsets.resize(num_grid_cells, [0, 0]);
+        }
         // --- End NEW ---
     }
 
@@ -167,36 +194,33 @@ impl SimulationState {
     fn resize_internal_buffers(&mut self, capacity: usize) {
         // Resize buffers that need to match organism count exactly
         if self.interaction_radii_buffer.len() < capacity {
-            self.interaction_radii_buffer.resize(capacity, Default::default());
+            self.interaction_radii_buffer
+                .resize(capacity, Default::default());
         }
-        if self.new_velocities_buffer.len() < capacity {
-            self.new_velocities_buffer.resize(capacity, None);
-        }
-        // Renamed buffer resize
+        // REMOVED: new_velocities_buffer resize
         if self.accumulated_aging_rate_buffer.len() < capacity {
             self.accumulated_aging_rate_buffer.resize(capacity, 0.0);
         }
         if self.plant_is_clustered_buffer.len() < capacity {
             self.plant_is_clustered_buffer.resize(capacity, false);
         }
-        // NEW: Resize eating boost buffer, initialize new elements to 1.0 (no boost)
         if self.eating_boost_buffer.len() < capacity {
             self.eating_boost_buffer.resize(capacity, 1.0);
         }
 
         // Truncate buffers if they became longer than organisms list
         self.interaction_radii_buffer.truncate(capacity);
-        self.new_velocities_buffer.truncate(capacity);
-        // Renamed buffer truncate
+        // REMOVED: new_velocities_buffer truncate
         self.accumulated_aging_rate_buffer.truncate(capacity);
         self.plant_is_clustered_buffer.truncate(capacity);
-        self.eating_boost_buffer.truncate(capacity); // NEW
+        self.eating_boost_buffer.truncate(capacity);
 
         // Buffers that just need clearing don't need resizing here (e.g., new_organism_buffer).
     }
 
+    // MODIFIED: Apply GLOBAL_RADIUS_SCALE_FACTOR
     fn create_organism(
-        rng: &mut SimRng,
+        rng: &mut SimRng, // Still takes SimRng for deterministic initialization
         window_size: PhysicalSize<u32>,
         kind: OrganismType,
         config: &SimulationConfig,
@@ -214,14 +238,18 @@ impl SimulationState {
 
         let min_radius = organism_config.min_radius;
         let max_radius = organism_config.max_radius;
-        let radius = if min_radius < max_radius {
+        let initial_radius = if min_radius < max_radius {
             rng.gen_range(min_radius..=max_radius)
         } else {
             min_radius
         };
 
+        // --- Apply Global Scale ---
+        let radius = (initial_radius * GLOBAL_RADIUS_SCALE_FACTOR).max(0.1); // Ensure non-zero radius
+
         let velocity = if organism_config.movement_speed_factor > 0.0 {
             let angle = rng.gen_range(0.0..TAU);
+            // Velocity depends on scaled radius
             Vec2::from_angle(angle) * organism_config.movement_speed_factor * radius
         } else {
             Vec2::ZERO
@@ -238,7 +266,7 @@ impl SimulationState {
         let growth_rate = organism_config.base_growth_rate;
         let color = mutate_color(
             Vec4::from(organism_config.base_color),
-            rng,
+            rng, // Use the passed RNG
             INITIAL_COLOR_MUTATION_MAX_DELTA,
         );
 
@@ -250,18 +278,21 @@ impl SimulationState {
             lifetime,
             growth_rate,
             color,
-            radius, // Store the simulation radius
+            radius, // Store the globally scaled simulation radius
             config: organism_config.clone(),
         }
     }
 
-    fn create_offspring(
+    // MODIFIED: Apply GLOBAL_RADIUS_SCALE_FACTOR
+    // Needs to accept Rng generic bound for thread_rng
+    fn create_offspring<R: Rng>(
+        // Accept generic Rng
         parent: &Organism,
         window_size: PhysicalSize<u32>,
-        rng: &mut SimRng,
-        _config: &SimulationConfig, // Prefix unused parameter with underscore
+        rng: &mut R,                // Use generic Rng
+        _config: &SimulationConfig, // Keep parameter prefixed if potentially used later
     ) -> Organism {
-        // Offset depends on simulation radius
+        // Offset depends on parent's (scaled) simulation radius
         let spawn_offset_dist = parent.radius * SPAWN_OFFSET_RADIUS_FACTOR;
         let angle_offset = rng.gen_range(0.0..TAU);
         let offset = Vec2::from_angle(angle_offset) * spawn_offset_dist;
@@ -273,10 +304,17 @@ impl SimulationState {
         let max_radius = parent.config.max_radius;
         let radius_delta = rng
             .gen_range(-OFFSPRING_RADIUS_MUTATION_MAX_DELTA..=OFFSPRING_RADIUS_MUTATION_MAX_DELTA);
-        let radius = (parent.radius + radius_delta).clamp(min_radius, max_radius);
+        // Calculate mutated radius based on parent's scaled radius
+        let mutated_radius_before_scale = (parent.radius / GLOBAL_RADIUS_SCALE_FACTOR.max(0.01)) + radius_delta;
+        // Clamp based on *config* limits, then apply global scale
+        let clamped_radius_before_scale = mutated_radius_before_scale.clamp(min_radius, max_radius);
+
+        // --- Apply Global Scale ---
+        let radius = (clamped_radius_before_scale * GLOBAL_RADIUS_SCALE_FACTOR).max(0.1); // Ensure non-zero radius
 
         let velocity = if parent.config.movement_speed_factor > 0.0 {
             let angle = rng.gen_range(0.0..TAU);
+            // Velocity depends on scaled radius
             Vec2::from_angle(angle) * parent.config.movement_speed_factor * radius
         } else {
             Vec2::ZERO
@@ -301,7 +339,7 @@ impl SimulationState {
             lifetime,
             growth_rate,
             color,
-            radius,
+            radius, // Store the globally scaled simulation radius
             config: parent.config.clone(),
         }
     }
@@ -316,24 +354,30 @@ impl SimulationState {
         )
     }
 
-    // --- Build grid also populates GPU grid data (No changes needed here) ---
+    // Build grid remains sequential
     fn build_grid(&mut self) {
         self.grid.clear();
         self.gpu_grid_indices.clear();
 
-        // --- Prepare GPU grid structure (using HashMap as intermediate) ---
         let mut temp_gpu_grid: HashMap<usize, Vec<u32>> = HashMap::new();
-        let grid_w = self.grid_width; // Cache locally
+        let grid_w = self.grid_width;
 
-        // Populate temporary grid and simulation grid
         for (index, organism) in self.organisms.iter().enumerate() {
             let key @ (cell_x, cell_y) = self.get_grid_key(organism.position);
-
-            // Add to CPU grid (for simulation logic)
             self.grid.entry(key).or_default().push(index);
 
-            // Add to temporary GPU grid (flat index)
             let flat_index = (cell_x + cell_y * grid_w) as usize;
+            // Ensure gpu_grid_offsets is correctly sized before access
+            let num_grid_cells = (self.grid_width * self.grid_height).max(1) as usize;
+            if self.gpu_grid_offsets.len() != num_grid_cells {
+                log::warn!(
+                    "Resizing gpu_grid_offsets in build_grid ({} -> {})",
+                    self.gpu_grid_offsets.len(),
+                    num_grid_cells
+                );
+                self.gpu_grid_offsets.resize(num_grid_cells, [0, 0]);
+            }
+
             if flat_index < self.gpu_grid_offsets.len() {
                 temp_gpu_grid
                     .entry(flat_index)
@@ -341,17 +385,16 @@ impl SimulationState {
                     .push(index as u32);
             } else {
                 log::warn!(
-                    "Calculated flat grid index {} out of bounds (size {}) for organism at {:?}. Clamping.",
+                    "Calculated flat grid index {} out of bounds (size {}) for organism at {:?}. Skipping.", // Changed message slightly
                     flat_index,
                     self.gpu_grid_offsets.len(),
                     organism.position
                 );
-                // Attempt to add to the last valid cell as a fallback? Or just skip? Skipping is safer.
             }
         }
 
-        // Flatten the temporary grid into gpu_grid_indices and calculate offsets
         let mut current_offset = 0u32;
+        // Iterate using the guaranteed length
         for i in 0..self.gpu_grid_offsets.len() {
             if let Some(indices) = temp_gpu_grid.get(&i) {
                 let count = indices.len() as u32;
@@ -359,12 +402,12 @@ impl SimulationState {
                 self.gpu_grid_indices.extend_from_slice(indices);
                 current_offset += count;
             } else {
-                // No organisms in this cell
                 self.gpu_grid_offsets[i] = [current_offset, 0];
             }
         }
     }
 
+    // --- Simulation Update - MAJOR REFACTOR ---
     pub fn update(&mut self, delta_time: f32) {
         if self.is_paused {
             return;
@@ -374,292 +417,371 @@ impl SimulationState {
             return;
         }
 
-        let window_size = self.window_size;
         let current_organism_count = self.organisms.len();
+        if current_organism_count == 0 {
+            return;
+        }
 
-        // --- Clear and Resize Buffers ---
+        // --- Clear volatile buffers ---
         self.new_organism_buffer.clear();
         self.removal_indices_buffer.clear();
         self.removal_indices_set.clear();
-        self.resize_internal_buffers(current_organism_count); // Ensure sim buffers are correct size
+        self.resize_internal_buffers(current_organism_count);
 
-        // --- Reset State Buffers ---
+        // --- Reset State Buffers (Sequential OK) ---
         for i in 0..current_organism_count {
-            self.new_velocities_buffer[i] = None;
-            // Renamed buffer reset
             self.accumulated_aging_rate_buffer[i] = 0.0;
             self.plant_is_clustered_buffer[i] = false;
-            // Reset eating boost buffer to 1.0 (no boost)
             self.eating_boost_buffer[i] = 1.0;
         }
 
-        // --- Build Grid (Populates both CPU HashMap and GPU vectors) ---
+        // --- Build Grid (Sequential) ---
         self.build_grid();
 
-        // --- Calculate Interaction Radii ---
+        // --- Calculate Interaction Radii (Sequential) ---
+        // Interaction radii depend on the organism's current (potentially scaled) radius
+        // Pushaway radius uses the ABSOLUTE config value.
         for (i, org) in self.organisms.iter().enumerate() {
-            let radius = org.radius;
+            let radius = org.radius; // Use the stored (potentially scaled) radius
+            let pushaway_radius = org.config.organism_min_pushaway_radius.max(0.0);
             self.interaction_radii_buffer[i] = match org.kind {
                 OrganismType::Plant => InteractionRadii {
                     perception_sq: 0.0,
-                    eating_sq: 0.0, // Plants don't eat
+                    eating_sq: 0.0,
                     clustering_sq: (radius * org.config.clustering_radius_factor).powi(2),
+                    pushaway_sq: pushaway_radius.powi(2), // Based on config
                 },
                 OrganismType::Fish => InteractionRadii {
                     perception_sq: (radius * org.config.perception_radius_factor).powi(2),
                     eating_sq: (radius * org.config.eating_radius_factor).powi(2),
-                    clustering_sq: 0.0, // Fish don't cluster this way
+                    clustering_sq: 0.0,
+                    pushaway_sq: pushaway_radius.powi(2), // Based on config
                 },
                 OrganismType::Bug => InteractionRadii {
-                    perception_sq: (radius * org.config.perception_radius_factor).powi(2), // Bug perception needed for influence
+                    perception_sq: (radius * org.config.perception_radius_factor).powi(2),
                     eating_sq: (radius * org.config.eating_radius_factor).powi(2),
-                    clustering_sq: 0.0, // Bugs don't cluster this way
+                    clustering_sq: 0.0,
+                    pushaway_sq: pushaway_radius.powi(2), // Based on config
                 },
             };
         }
 
-        // --- Interaction Loop (Uses CPU grid HashMap) ---
-        for i in 0..current_organism_count {
-            // Early exit if organism was already marked for removal (e.g., eaten in a previous inner loop)
-            // This check is less likely to be needed now but good for safety if interactions become more complex.
-            if self.removal_indices_set.contains(&i) { continue; }
+        // --- Parallel Interaction Calculation ---
+        // Capture necessary data by reference
+        let organisms_ref = &self.organisms; // Immutable borrow starts here
+        let grid_ref = &self.grid;
+        let radii_ref = &self.interaction_radii_buffer;
+        // REMOVED: unused config_ref capture
 
-            let organism_i = &self.organisms[i]; // Borrow immutably first
-            let pos_i = organism_i.position;
-            let grid_key_i = self.get_grid_key(pos_i);
-            let radii_i = self.interaction_radii_buffer[i]; // Already calculated
+        let calculation_results: Vec<OrganismCalculationResult> = (0..current_organism_count)
+            .into_par_iter()
+            .map(|i| {
+                // --- Start of parallel work for organism `i` ---
+                let mut result = OrganismCalculationResult {
+                    index: i,
+                    ..Default::default()
+                };
+                // Bounds check (paranoid, but safe if current_organism_count somehow changes)
+                if i >= organisms_ref.len() {
+                    return result;
+                }
 
-            let mut influence_vector = Vec2::ZERO;
-            let mut neighbor_count = 0; // Generic neighbor count for influence
+                let organism_i = &organisms_ref[i];
+                let pos_i = organism_i.position;
+                // Call get_grid_key using `self` implicitly captured - OK as it only reads state
+                let grid_key_i = self.get_grid_key(pos_i);
+                // Bounds check for radii_ref
+                let radii_i = if i < radii_ref.len() {
+                    radii_ref[i]
+                } else {
+                    Default::default()
+                };
 
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    let check_key = (grid_key_i.0 + dx, grid_key_i.1 + dy);
-                    // Use CPU grid for simulation interactions
-                    if let Some(neighbor_indices) = self.grid.get(&check_key) {
-                        for &j in neighbor_indices {
-                            // Skip self, already removed, or out of bounds
-                            if i == j { continue; }
-                            if self.removal_indices_set.contains(&j) { continue; } // Skip if prey already marked
-                            if j >= current_organism_count { continue; } // Safety check
+                let mut influence_vector = Vec2::ZERO;
+                let mut neighbor_count = 0;
+                let mut max_boost_factor_for_i = 1.0f32;
+                let mut thread_rng = thread_rng();
+                let mut pushed_away_this_tick = false; // Track if push force applied
 
-                            // It's safe to borrow organism_j now
-                            let organism_j = &self.organisms[j];
-                            let pos_j = organism_j.position;
-                            let vec_ij = pos_j - pos_i;
-                            let dist_sq = vec_ij.length_squared();
-
-                            // --- Influence Calculation (Fish and Bugs influence perception) ---
-                            if (organism_i.kind == OrganismType::Fish || organism_i.kind == OrganismType::Bug)
-                                && dist_sq < radii_i.perception_sq && dist_sq > 1e-6 {
-                                let influence_factor = match organism_j.kind {
-                                    OrganismType::Plant => organism_i.config.influence_plant,
-                                    OrganismType::Fish => organism_i.config.influence_fish,
-                                    OrganismType::Bug => organism_i.config.influence_bug,
-                                };
-                                if influence_factor.abs() > 1e-6 {
-                                    influence_vector += vec_ij.normalize_or_zero() * influence_factor;
-                                    neighbor_count += 1;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let check_key = (grid_key_i.0 + dx, grid_key_i.1 + dy);
+                        if let Some(neighbor_indices) = grid_ref.get(&check_key) {
+                            for &j in neighbor_indices {
+                                // Combine checks for clarity and efficiency
+                                if i == j || j >= organisms_ref.len() {
+                                    continue;
                                 }
-                            }
 
-                            // --- Eating Calculation & Conditional Aging (Fish and Bugs eat) ---
-                            if (organism_i.kind == OrganismType::Fish || organism_i.kind == OrganismType::Bug)
-                                && dist_sq < radii_i.eating_sq
-                            {
-                                // Determine the boost factor based on predator (i) eating prey (j)
-                                let boost_factor = match organism_j.kind {
-                                    OrganismType::Plant => organism_i.config.eating_spawn_boost_factor_plant,
-                                    OrganismType::Fish => organism_i.config.eating_spawn_boost_factor_fish,
-                                    OrganismType::Bug => organism_i.config.eating_spawn_boost_factor_bug,
-                                };
+                                let organism_j = &organisms_ref[j];
+                                let pos_j = organism_j.position;
+                                let vec_ij = pos_j - pos_i;
+                                let dist_sq = vec_ij.length_squared();
 
-                                // --- Apply boost and aging ONLY if boost_factor > 1.0 ---
-                                if boost_factor > 1.0 {
-                                    // Update predator's boost buffer (take max boost from all prey eaten this tick)
-                                    self.eating_boost_buffer[i] = self.eating_boost_buffer[i].max(boost_factor);
+                                // --- Push-away Check (High Priority) ---
+                                // Check if organism J is within organism I's pushaway radius
+                                if radii_i.pushaway_sq > 0.0 && dist_sq < radii_i.pushaway_sq && dist_sq > 1e-6 {
+                                    let push_direction = -vec_ij.normalize_or_zero(); // Push i away from j
+                                    // Add a strong repulsive force, potentially scaled by inverse distance squared
+                                    let force_scale = 1.0 / (dist_sq + 1e-4); // Avoid division by zero, strengthen close push
+                                    influence_vector += push_direction * PUSH_AWAY_FORCE_MAGNITUDE * force_scale;
+                                    pushed_away_this_tick = true;
+                                    neighbor_count += 1; // Count this as an interaction
+                                    // Skip other influence/eating checks if being pushed away? Optional.
+                                    // For now, let push force dominate by adding to influence_vector.
+                                    // continue; // Uncomment this to completely ignore other influences if pushed
+                                }
 
-                                    // Apply aging penalty accumulation to the prey
-                                    // Accumulate the rate defined in the *prey's* config
-                                    let prey_aging_rate = organism_j.config.aging_rate_when_eaten;
-                                    if prey_aging_rate > 0.0 {
-                                        // Check index j validity again just in case
-                                        if j < self.accumulated_aging_rate_buffer.len() { // Use buffer len for safety
-                                            self.accumulated_aging_rate_buffer[j] += prey_aging_rate;
+                                // --- Standard Influence (Only if not dominated by push-away maybe?) ---
+                                // Let's allow standard influence to still be calculated, but the push vector will likely dominate.
+                                // if !pushed_away_this_tick { // Optional: only apply standard influence if not pushed
+                                if (organism_i.kind == OrganismType::Fish
+                                    || organism_i.kind == OrganismType::Bug)
+                                    && dist_sq < radii_i.perception_sq
+                                    && dist_sq > 1e-6
+                                {
+                                    let influence_factor = match organism_j.kind {
+                                        OrganismType::Plant => organism_i.config.influence_plant,
+                                        OrganismType::Fish => organism_i.config.influence_fish,
+                                        OrganismType::Bug => organism_i.config.influence_bug,
+                                    };
+                                    if influence_factor.abs() > 1e-6 {
+                                        influence_vector +=
+                                            vec_ij.normalize_or_zero() * influence_factor;
+                                        if !pushed_away_this_tick { neighbor_count += 1; } // Don't double-count if pushed
+                                    }
+                                }
+                                // }
+
+                                // --- Eating & Aging Effects (Can happen even if pushing/pushed) ---
+                                if (organism_i.kind == OrganismType::Fish
+                                    || organism_i.kind == OrganismType::Bug)
+                                    && dist_sq < radii_i.eating_sq
+                                {
+                                    let boost_factor = match organism_j.kind {
+                                        OrganismType::Plant => {
+                                            organism_i.config.eating_spawn_boost_factor_plant
+                                        }
+                                        OrganismType::Fish => {
+                                            organism_i.config.eating_spawn_boost_factor_fish
+                                        }
+                                        OrganismType::Bug => {
+                                            organism_i.config.eating_spawn_boost_factor_bug
+                                        }
+                                    };
+
+                                    if boost_factor > 1.0 {
+                                        max_boost_factor_for_i =
+                                            max_boost_factor_for_i.max(boost_factor);
+                                        let prey_aging_rate =
+                                            organism_j.config.aging_rate_when_eaten;
+                                        if prey_aging_rate > 0.0 {
+                                            result.prey_aging_effects.push((j, prey_aging_rate));
                                         }
                                     }
-                                    // Optional: Mark prey for removal immediately if eaten by certain predators?
-                                    // Example: if organism_i.kind == OrganismType::Bug && organism_j.kind == OrganismType::Fish {
-                                    //     self.removal_indices_set.insert(j); // Mark fish j for removal
-                                    // }
                                 }
-                                // If boost_factor <= 1.0, do nothing for boost or aging for this interaction.
-                            }
 
-                            // --- Plant Clustering (Only plants check other plants) ---
-                            if organism_i.kind == OrganismType::Plant
-                                && organism_j.kind == OrganismType::Plant
-                                && dist_sq < radii_i.clustering_sq
-                            {
-                                self.plant_is_clustered_buffer[i] = true;
-                            }
+                                // --- Plant Clustering ---
+                                if organism_i.kind == OrganismType::Plant
+                                    && organism_j.kind == OrganismType::Plant
+                                    && dist_sq < radii_i.clustering_sq
+                                {
+                                    result.is_clustered = true;
+                                }
+                            } // End loop j
+                        } // End if grid cell
+                    } // End loop dy
+                } // End loop dx
 
-                        } // End loop over neighbors j
-                    } // End if grid cell exists
-                } // End loop dy
-            } // End loop dx
+                result.spawn_boost_obtained = max_boost_factor_for_i;
 
-            // --- Calculate New Velocity (based on influence, if applicable) ---
-            if organism_i.kind == OrganismType::Fish || organism_i.kind == OrganismType::Bug {
-                let radius_i = organism_i.radius; // Use already borrowed organism_i
-                let random_angle = self.rng.gen_range(0.0..TAU);
-                let random_direction = Vec2::from_angle(random_angle);
-                let normalized_influence = if neighbor_count > 0 {
-                    influence_vector.normalize_or_zero()
-                } else {
-                    // If no influence, maintain current direction (normalized velocity) or pick random if stopped
-                    organism_i.velocity.normalize_or_zero()
-                };
-                let influence_weight = organism_i.config.influence_weight.clamp(0.0, 1.0);
+                // --- Calculate New Velocity ---
+                if organism_i.kind == OrganismType::Fish || organism_i.kind == OrganismType::Bug {
+                    let radius_i = organism_i.radius; // Use stored (potentially scaled) radius
+                    let random_angle = thread_rng.gen_range(0.0..TAU);
+                    let random_direction = Vec2::from_angle(random_angle);
 
-                // If no neighbors influenced, desired direction tends towards random walk based on weight
-                let desired_direction = (random_direction * (1.0 - influence_weight)
-                    + normalized_influence * influence_weight)
-                    .normalize_or_zero();
+                    // --- Normalize influence vector: if push force was applied, it will dominate ---
+                    let normalized_influence = if neighbor_count > 0 { // Use neighbor_count which includes push interactions
+                        influence_vector.normalize_or_zero()
+                    } else {
+                        organism_i.velocity.normalize_or_zero() // Maintain direction if no interactions
+                    };
 
-                let current_dir = organism_i.velocity.normalize_or_zero();
-                let angle_diff = current_dir.angle_between(desired_direction);
-                let max_turn = organism_i.config.max_turn_angle_per_sec * dt;
-                let turn_amount = angle_diff.clamp(-max_turn, max_turn);
+                    let influence_weight = organism_i.config.influence_weight.clamp(0.0, 1.0);
 
-                let final_direction = if current_dir.length_squared() > 1e-6 {
-                    Vec2::from_angle(current_dir.to_angle() + turn_amount)
-                } else {
-                    desired_direction // Start moving in desired direction if stopped
-                };
+                    // --- Blend desired direction ---
+                    // If pushed away, influence_weight might be less important, or maybe set to 1.0?
+                    // Let's keep the blend for now. Push force magnitude should handle it.
+                    let desired_direction = (random_direction * (1.0 - influence_weight)
+                        + normalized_influence * influence_weight)
+                        .normalize_or_zero();
 
-                self.new_velocities_buffer[i] =
-                    Some(final_direction * organism_i.config.movement_speed_factor * radius_i);
+                    let current_dir = organism_i.velocity.normalize_or_zero();
+                    let angle_diff = current_dir.angle_between(desired_direction);
+                    let max_turn = organism_i.config.max_turn_angle_per_sec * dt;
+                    let turn_amount = angle_diff.clamp(-max_turn, max_turn);
+                    let final_direction = if current_dir.length_squared() > 1e-6 {
+                        Vec2::from_angle(current_dir.to_angle() + turn_amount)
+                    } else {
+                        desired_direction // Start moving in desired direction if stopped
+                    };
+                    // Velocity depends on scaled radius
+                    result.new_velocity =
+                        Some(final_direction * organism_i.config.movement_speed_factor * radius_i);
+                }
+                result
+            })
+            .collect(); // Collect results. Immutable borrow `organisms_ref` potentially ends scope here *if not used later*.
+
+        // --- Sequential Application Phase ---
+
+        // 1. Apply aging effects from eating to the shared buffer
+        for result in &calculation_results {
+            for &(prey_index, aging_rate) in &result.prey_aging_effects {
+                // Bounds check before modifying buffer
+                if prey_index < self.accumulated_aging_rate_buffer.len() {
+                    self.accumulated_aging_rate_buffer[prey_index] += aging_rate;
+                }
             }
-            // Plants don't calculate velocity based on influence
+        }
 
-        } // End Interaction Loop (over i)
+        // --- FIX: Get organism count *before* the mutable loop ---
+        let organism_count_before_mutation = self.organisms.len();
 
-        // --- Apply Removals Marked During Interaction (e.g., if immediate eating removal was implemented) ---
-        // This requires converting the HashSet to a sorted Vec first if immediate removal occurs.
-        // If only aging happens, removals are handled later based on age.
-        // Example if using immediate removal:
-        // if !self.removal_indices_set.is_empty() {
-        //     self.removal_indices_buffer.extend(self.removal_indices_set.iter());
-        //     // Avoid duplicates if already pushed from age later
-        //     self.removal_indices_buffer.sort_unstable_by(|a, b| b.cmp(a));
-        //     self.removal_indices_buffer.dedup();
-        // }
+        // 2. Update state, apply velocity, handle aging, death, and spawning
+        let window_w = self.window_size.width as f32;
+        let window_h = self.window_size.height as f32;
+        let max_organisms = MAX_ORGANISMS;
+        let sim_config_ref = &self.config; // Capture config for create_offspring
+        let mut spawn_rng = thread_rng();
 
-
-        // --- Update State & Spawning Loop ---
+        // Iterate using the count from the *start* of the update, before any removals
         for i in 0..current_organism_count {
-            // Skip if already marked for removal (e.g. eaten or previously aged out)
-            if self.removal_indices_set.contains(&i) {
+            // Ensure the result index matches the loop index `i`
+            // This relies on Rayon's collect preserving order for indexed iterators.
+            if i >= calculation_results.len() {
                 continue;
+            } // Safety check
+            let result = &calculation_results[i];
+            // Basic sanity check, remove in release if perf sensitive
+            debug_assert_eq!(
+                result.index, i,
+                "Result index mismatch! Expected {}, got {}",
+                i, result.index
+            );
+
+            // --- Ensure organism index `i` is still valid in the main vector ---
+            if i >= organism_count_before_mutation {
+                continue;
+            } // Skip if index out of bounds
+
+            // Update buffers based on calculated results (safe before mutable borrow)
+            self.eating_boost_buffer[i] = result.spawn_boost_obtained;
+            self.plant_is_clustered_buffer[i] = result.is_clustered;
+
+            // --- Update Organism State (Mutable borrow starts here) ---
+            let organism = &mut self.organisms[i]; // This is now safe
+
+            // Apply calculated velocity
+            if let Some(new_vel) = result.new_velocity {
+                organism.velocity = new_vel;
             }
+            organism.position += organism.velocity * dt;
 
-            // --- Update Organism State ---
-            { // Scope for mutable borrow of self.organisms[i]
-                let organism = &mut self.organisms[i];
+            // Wrap around screen edges
+            organism.position.x = (organism.position.x + window_w) % window_w;
+            organism.position.y = (organism.position.y + window_h) % window_h;
 
-                // Apply calculated velocity
-                if let Some(new_vel) = self.new_velocities_buffer[i] {
-                    organism.velocity = new_vel;
+            // Calculate final aging
+            let base_age_increase = dt;
+            // Bounds check aging buffer access
+            let extra_aging_rate = if i < self.accumulated_aging_rate_buffer.len() {
+                self.accumulated_aging_rate_buffer[i]
+            } else {
+                0.0
+            };
+            let effective_age_increase = base_age_increase + extra_aging_rate * dt;
+            organism.age += effective_age_increase;
+
+            // Check for death by old age
+            if organism.age >= organism.lifetime {
+                if self.removal_indices_set.insert(i) {
+                    self.removal_indices_buffer.push(i);
                 }
-                organism.position += organism.velocity * dt;
-
-                // Wrap around screen edges
-                organism.position.x =
-                    (organism.position.x + window_size.width as f32) % window_size.width as f32;
-                organism.position.y =
-                    (organism.position.y + window_size.height as f32) % window_size.height as f32;
-
-                // Calculate aging
-                let mut effective_age_increase = dt;
-                // Apply accumulated extra aging rate (if any)
-                let accumulated_rate = self.accumulated_aging_rate_buffer[i];
-                if accumulated_rate > 0.0 {
-                    // The accumulated value IS the total rate from all predators this tick
-                    effective_age_increase += accumulated_rate * dt;
-                }
-                organism.age += effective_age_increase;
-
-                // Check for death by old age
-                if organism.age >= organism.lifetime {
-                    // Use try_insert which is slightly cleaner if duplicates might occur
-                    if self.removal_indices_set.insert(i) {
-                        self.removal_indices_buffer.push(i);
-                    }
-                    continue; // Skip spawning logic if dead
-                }
-            } // End mutable borrow for state update
+                continue; // Skip spawning if dead
+            }
 
             // --- Spawning Logic (Only if alive) ---
-            let organism = &self.organisms[i]; // Immutable borrow now
             let base_prob_per_sec = organism.growth_rate / organism.lifetime.max(1.0);
             let mut spawn_prob_this_tick = base_prob_per_sec * dt;
-
-            // Apply boost/penalty based on what was beneficially eaten this tick
-            spawn_prob_this_tick *= self.eating_boost_buffer[i]; // Use the calculated boost factor (>1.0)
-
-            // Apply boost for clustering (if applicable, currently only plants)
-            if organism.kind == OrganismType::Plant && self.plant_is_clustered_buffer[i] {
-                // Example: spawn_prob_this_tick *= 1.1; // Small boost for clustering
+            // Bounds check boost buffer access
+            spawn_prob_this_tick *= if i < self.eating_boost_buffer.len() {
+                self.eating_boost_buffer[i]
+            } else {
+                1.0
+            };
+            // Bounds check cluster buffer access
+            if organism.kind == OrganismType::Plant
+                && i < self.plant_is_clustered_buffer.len()
+                && self.plant_is_clustered_buffer[i]
+            {
+                // spawn_prob_this_tick *= 1.1; // Optional clustering boost
             }
 
-            if spawn_prob_this_tick > 0.0 // Check probability is positive
-                && self.rng.gen_bool(spawn_prob_this_tick.clamp(0.0, 1.0) as f64) // Clamp prob to [0, 1]
+            if spawn_prob_this_tick > 0.0
+                && spawn_rng.gen_bool(spawn_prob_this_tick.clamp(0.0, 1.0) as f64)
             {
-                // Check against MAX_ORGANISMS, accounting for pending removals and additions
-                let potential_next_count = self.organisms.len() - self.removal_indices_set.len() + self.new_organism_buffer.len() + 1;
-                if potential_next_count <= MAX_ORGANISMS {
+                // --- FIX: Use the pre-calculated count ---
+                let potential_next_count = organism_count_before_mutation // Use count before this loop
+                    - self.removal_indices_set.len() // Use current removal count
+                    + self.new_organism_buffer.len() + 1; // Use current new count
+
+                if potential_next_count <= max_organisms {
                     self.new_organism_buffer.push(Self::create_offspring(
                         organism,
-                        window_size,
-                        &mut self.rng,
-                        &self.config, // Pass the main config reference
+                        self.window_size,
+                        &mut spawn_rng,
+                        sim_config_ref, // Pass the captured ref
                     ));
                 }
             }
-        } // End Update State & Spawning Loop
+        } // --- End Sequential Application Loop ---
 
-        // --- Apply Removals and Additions ---
-        // Sort removals by index descending to allow swap_remove without index issues
-        self.removal_indices_buffer.sort_unstable_by(|a, b| b.cmp(a));
-        // Ensure no duplicates if items were added to set and buffer separately
+        // --- Apply Removals and Additions (Sequential - Unchanged) ---
+        self.removal_indices_buffer
+            .sort_unstable_by(|a, b| b.cmp(a));
         self.removal_indices_buffer.dedup();
 
+        // Use a temporary vec for swap_remove indices to satisfy borrow checker if needed,
+        // but direct iteration should be fine here as we don't borrow `self.organisms` elsewhere.
         for &index_to_remove in &self.removal_indices_buffer {
-            if index_to_remove < self.organisms.len() { // Check index is still valid
+            // Check index validity *against the current length* before swap_remove
+            if index_to_remove < self.organisms.len() {
                 self.organisms.swap_remove(index_to_remove);
             } else {
                 log::warn!(
-                    "Attempted swap_remove with invalid index {} (current len {})",
-                    index_to_remove, self.organisms.len()
+                    "Attempted swap_remove with invalid index {} (current len {} after previous removals)", // Clarified log
+                    index_to_remove,
+                    self.organisms.len()
                 );
             }
         }
         self.organisms.extend(self.new_organism_buffer.drain(..));
 
-        // Final check, although the check during spawning should prevent this usually
-        if self.organisms.len() > MAX_ORGANISMS {
+        // Final count check
+        if self.organisms.len() > max_organisms {
             log::warn!(
-                "Exceeded MAX_ORGANISMS after additions/removals, truncating from {} to {}",
+                "Exceeded MAX_ORGANISMS, truncating from {} to {}",
                 self.organisms.len(),
-                MAX_ORGANISMS
+                max_organisms
             );
-            self.organisms.truncate(MAX_ORGANISMS);
+            self.organisms.truncate(max_organisms);
         }
 
         // Ensure internal sim buffers are sized correctly for the *next* frame
         self.resize_internal_buffers(self.organisms.len());
-    }
+    } // --- End Update Method ---
 
     pub fn adjust_speed(&mut self, increase: bool) {
         self.speed_multiplier = if increase {
@@ -677,13 +799,12 @@ impl SimulationState {
             self.grid_cell_size = avg_radius * GRID_CELL_SIZE_FACTOR;
             self.grid_width = (new_size.width as f32 / self.grid_cell_size).ceil() as i32;
             self.grid_height = (new_size.height as f32 / self.grid_cell_size).ceil() as i32;
-            self.grid.clear(); // Clear CPU grid
-            // --- Resize GPU grid offset buffer ---
-            let num_grid_cells = (self.grid_width * self.grid_height) as usize;
-            self.gpu_grid_offsets.clear(); // Clear old offsets
-            self.gpu_grid_offsets.resize(num_grid_cells, [0, 0]); // Resize and fill with default
-            self.gpu_grid_indices.clear(); // Indices will be rebuilt in next `build_grid`
-            // --- End Resize ---
+            self.grid.clear();
+            let num_grid_cells = (self.grid_width * self.grid_height).max(1) as usize;
+            if self.gpu_grid_offsets.len() != num_grid_cells {
+                self.gpu_grid_offsets.resize(num_grid_cells, [0, 0]);
+            }
+            self.gpu_grid_indices.clear();
             println!(
                 "Resized simulation area to {}x{}, grid to {}x{} (cell size ~{:.1})",
                 new_size.width,
@@ -710,18 +831,14 @@ impl SimulationState {
         self.grid_cell_size = avg_radius * GRID_CELL_SIZE_FACTOR;
         self.grid_width = (self.window_size.width as f32 / self.grid_cell_size).ceil() as i32;
         self.grid_height = (self.window_size.height as f32 / self.grid_cell_size).ceil() as i32;
-        self.initialize_organisms(); // Resizes sim buffers and gpu_grid_offsets
+        self.initialize_organisms();
         self.speed_multiplier = INITIAL_SPEED_MULTIPLIER;
         self.is_paused = false;
-        self.grid.clear(); // Clear CPU grid
-        // Clear reusable sim buffers
+        self.grid.clear();
         self.new_organism_buffer.clear();
         self.removal_indices_buffer.clear();
         self.removal_indices_set.clear();
-        // --- Clear GPU grid index buffer ---
         self.gpu_grid_indices.clear();
-        // Offsets buffer was already resized in initialize_organisms
-        // --- End Clear ---
         println!(
             "Restarted with grid {}x{} (cell size ~{:.1})",
             self.grid_width, self.grid_height, self.grid_cell_size
@@ -735,6 +852,7 @@ impl SimulationState {
         self.is_paused
     }
 
+    // No changes needed
     pub fn get_organism_counts(&self) -> (usize, usize, usize) {
         let mut plant_count = 0;
         let mut fish_count = 0;
@@ -749,26 +867,21 @@ impl SimulationState {
         (plant_count, fish_count, bug_count)
     }
 
-    // --- Getters for GPU grid data (No changes needed) ---
     #[inline]
     pub fn get_gpu_grid_indices(&self) -> &[u32] {
         &self.gpu_grid_indices
     }
-
     #[inline]
     pub fn get_gpu_grid_offsets(&self) -> &[[u32; 2]] {
         &self.gpu_grid_offsets
     }
-
     #[inline]
     pub fn get_grid_dimensions(&self) -> (i32, i32) {
         (self.grid_width, self.grid_height)
     }
-
     #[inline]
     pub fn get_grid_cell_size(&self) -> f32 {
         self.grid_cell_size
     }
-    // --- End Getters ---
 }
 // --- End of File: simulation.rs ---

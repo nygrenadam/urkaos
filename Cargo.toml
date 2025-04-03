@@ -12,6 +12,7 @@ env_logger = "0.11" # Optional: for wgpu logging
 bytemuck = { version = "1.14", features = ["derive"] } # For converting structs to bytes for buffers
 glam = "0.25"
 log = "0.4.27"
+rayon = "1.10.0"
 
 
 [profile.dev]

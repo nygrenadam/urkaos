@@ -72,8 +72,8 @@ pub struct Renderer<'a> {
 
 // --- Constants for Metaballs (Tunable) ---
 const METABALL_ISO_LEVEL: f32 = 0.95;
-const METABALL_SMOOTHNESS: f32 = 0.8;
-const VISUAL_RADIUS_MULTIPLIER: f32 = 1.5;
+const METABALL_SMOOTHNESS: f32 = 0.95;
+const VISUAL_RADIUS_MULTIPLIER: f32 = 1.2;
 
 // --- NEW: Constants for Buffer Allocation ---
 // Add some headroom beyond MAX_ORGANISMS for safety/flexibility
@@ -145,9 +145,24 @@ impl<'a> Renderer<'a> {
 
         // --- Create Buffers ---
         let fullscreen_vertices = [
-            FullscreenVertex { position: [-1.0, -1.0] }, FullscreenVertex { position: [1.0, -1.0] },
-            FullscreenVertex { position: [-1.0, 1.0] }, FullscreenVertex { position: [-1.0, 1.0] },
-            FullscreenVertex { position: [1.0, -1.0] }, FullscreenVertex { position: [1.0, 1.0] },
+            FullscreenVertex {
+                position: [-1.0, -1.0],
+            },
+            FullscreenVertex {
+                position: [1.0, -1.0],
+            },
+            FullscreenVertex {
+                position: [-1.0, 1.0],
+            },
+            FullscreenVertex {
+                position: [-1.0, 1.0],
+            },
+            FullscreenVertex {
+                position: [1.0, -1.0],
+            },
+            FullscreenVertex {
+                position: [1.0, 1.0],
+            },
         ];
         let fullscreen_vertex_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -162,10 +177,14 @@ impl<'a> Renderer<'a> {
             iso_level: METABALL_ISO_LEVEL,
             smoothness: METABALL_SMOOTHNESS,
             background_color: [
-                BACKGROUND_COLOR.r as f32, BACKGROUND_COLOR.g as f32,
-                BACKGROUND_COLOR.b as f32, BACKGROUND_COLOR.a as f32,
+                BACKGROUND_COLOR.r as f32,
+                BACKGROUND_COLOR.g as f32,
+                BACKGROUND_COLOR.b as f32,
+                BACKGROUND_COLOR.a as f32,
             ],
-            grid_dims: [0, 0], grid_cell_size: 0.0, _padding_grid: 0.0,
+            grid_dims: [0, 0],
+            grid_cell_size: 0.0,
+            _padding_grid: 0.0,
         };
         let global_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Global Uniform Buffer"),
@@ -182,12 +201,15 @@ impl<'a> Renderer<'a> {
         });
 
         // --- Pre-allocate Organism Storage Buffer based on MAX_ORGANISMS ---
-        let max_organisms_capacity = ((MAX_ORGANISMS as f32 * ORGANISM_BUFFER_HEADROOM_FACTOR) as usize).max(16);
-        let organism_storage_buffer_size =
-            (max_organisms_capacity * std::mem::size_of::<OrganismGpuData>()) as wgpu::BufferAddress;
+        let max_organisms_capacity =
+            ((MAX_ORGANISMS as f32 * ORGANISM_BUFFER_HEADROOM_FACTOR) as usize).max(16);
+        let organism_storage_buffer_size = (max_organisms_capacity
+            * std::mem::size_of::<OrganismGpuData>())
+            as wgpu::BufferAddress;
         log::info!(
             "Pre-allocating Organism Storage Buffer for {} organisms ({} bytes)",
-            max_organisms_capacity, organism_storage_buffer_size
+            max_organisms_capacity,
+            organism_storage_buffer_size
         );
         let organism_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Organism Storage Buffer (Pre-allocated)"),
@@ -197,12 +219,14 @@ impl<'a> Renderer<'a> {
         });
 
         // --- Pre-allocate Grid Indices Buffer ---
-        let max_grid_indices_capacity = (max_organisms_capacity * GRID_INDICES_HEADROOM_PER_ORGANISM).max(256);
+        let max_grid_indices_capacity =
+            (max_organisms_capacity * GRID_INDICES_HEADROOM_PER_ORGANISM).max(256);
         let grid_indices_buffer_size =
             (max_grid_indices_capacity * std::mem::size_of::<u32>()) as wgpu::BufferAddress;
         log::info!(
             "Pre-allocating Grid Indices Buffer for {} indices ({} bytes)",
-            max_grid_indices_capacity, grid_indices_buffer_size
+            max_grid_indices_capacity,
+            grid_indices_buffer_size
         );
         let grid_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Grid Indices Buffer (Pre-allocated)"),
@@ -210,7 +234,6 @@ impl<'a> Renderer<'a> {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
 
         // --- Grid Offsets Buffer (Still dynamically sized) ---
         // Start with a minimal buffer, will be resized in render() if needed based on window size
@@ -226,12 +249,18 @@ impl<'a> Renderer<'a> {
         let bind_group_layout_globals =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Globals Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry { // GlobalUniforms
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    // GlobalUniforms
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<GlobalUniforms>() as _),
-                    }, count: None,
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<GlobalUniforms>() as _,
+                        ),
+                    },
+                    count: None,
                 }],
             });
 
@@ -267,8 +296,12 @@ impl<'a> Renderer<'a> {
 
         // --- Create Bind Groups (Using pre-allocated buffers) ---
         let bind_group_globals = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Globals Bind Group"), layout: &bind_group_layout_globals,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: global_uniform_buffer.as_entire_binding() }],
+            label: Some("Globals Bind Group"),
+            layout: &bind_group_layout_globals,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: global_uniform_buffer.as_entire_binding(),
+            }],
         });
 
         // Create initial storage bind group - might be recreated later if grid_offsets resizes
@@ -276,10 +309,22 @@ impl<'a> Renderer<'a> {
             label: Some("Storage Bind Group (Initial Pre-allocated)"),
             layout: &bind_group_layout_storage,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: organism_storage_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: organism_count_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: grid_offsets_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: grid_indices_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: organism_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: organism_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: grid_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: grid_indices_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -294,31 +339,46 @@ impl<'a> Renderer<'a> {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader_module, entry_point: Some("vs_main"),
-                buffers: &[FullscreenVertex::desc()], compilation_options: Default::default(),
+                module: &shader_module,
+                entry_point: Some("vs_main"),
+                buffers: &[FullscreenVertex::desc()],
+                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader_module, entry_point: Some("fs_main"),
+                module: &shader_module,
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None, multisample: wgpu::MultisampleState::default(),
-            multiview: None, cache: None,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
         });
 
         Self {
-            surface, device, queue, config, size,
-            render_pipeline, fullscreen_vertex_buffer,
+            surface,
+            device,
+            queue,
+            config,
+            size,
+            render_pipeline,
+            fullscreen_vertex_buffer,
             organism_storage_buffer,
             // Removed max_organisms_in_buffer field
-            global_uniform_buffer, organism_count_buffer,
-            bind_group_layout_globals, bind_group_layout_storage,
-            bind_group_globals, bind_group_storage, // Store the initial one
-            grid_offsets_buffer, grid_indices_buffer,
+            global_uniform_buffer,
+            organism_count_buffer,
+            bind_group_layout_globals,
+            bind_group_layout_storage,
+            bind_group_globals,
+            bind_group_storage, // Store the initial one
+            grid_offsets_buffer,
+            grid_indices_buffer,
             // Removed max_grid_indices_in_buffer field
         }
     }
@@ -333,7 +393,9 @@ impl<'a> Renderer<'a> {
 
             let screen_res_data = [self.size.width as f32, self.size.height as f32];
             self.queue.write_buffer(
-                &self.global_uniform_buffer, 0, bytemuck::cast_slice(&screen_res_data),
+                &self.global_uniform_buffer,
+                0,
+                bytemuck::cast_slice(&screen_res_data),
             );
 
             // NOTE: grid_offsets_buffer will be resized dynamically within render()
@@ -342,7 +404,8 @@ impl<'a> Renderer<'a> {
 
             log::info!(
                 "Renderer resized window to {}x{}",
-                win_new_size.width, win_new_size.height
+                win_new_size.width,
+                win_new_size.height
             );
         }
     }
@@ -367,7 +430,9 @@ impl<'a> Renderer<'a> {
                 let render_radius = org.radius * VISUAL_RADIUS_MULTIPLIER.max(0.01);
                 OrganismGpuData {
                     world_position: org.position.into(),
-                    radius: render_radius, _padding1: 0.0, color: org.color.into(),
+                    radius: render_radius,
+                    _padding1: 0.0,
+                    color: org.color.into(),
                 }
             })
             .collect();
@@ -375,9 +440,11 @@ impl<'a> Renderer<'a> {
         // --- Assert that organism count doesn't exceed buffer capacity ---
         // This should ideally never fail if MAX_ORGANISMS is respected.
         debug_assert!(
-            (current_organism_count as u64 * std::mem::size_of::<OrganismGpuData>() as u64) <= self.organism_storage_buffer.size(),
+            (current_organism_count as u64 * std::mem::size_of::<OrganismGpuData>() as u64)
+                <= self.organism_storage_buffer.size(),
             "Organism count ({}) exceeds pre-allocated buffer size ({})!",
-            current_organism_count, self.organism_storage_buffer.size()
+            current_organism_count,
+            self.organism_storage_buffer.size()
         );
 
         // --- Prepare Grid GPU Data ---
@@ -391,16 +458,15 @@ impl<'a> Renderer<'a> {
         debug_assert!(
             required_indices_bytes as u64 <= self.grid_indices_buffer.size(),
             "Required grid indices ({}) exceed pre-allocated buffer size ({})!",
-            gpu_grid_indices.len(), self.grid_indices_buffer.size()
+            gpu_grid_indices.len(),
+            self.grid_indices_buffer.size()
         );
-
 
         // --- Flag to track if *storage bind group* needs recreating (only for grid_offsets now) ---
         let mut needs_bind_group_recreation = false;
 
         // --- REMOVED: Resize Organism Storage Buffer ---
         // --- REMOVED: Resize Grid Indices Buffer ---
-
 
         // --- Resize Grid Offsets Buffer if Needed (Based on grid dimensions / window size) ---
         let required_offsets_bytes =
@@ -410,11 +476,15 @@ impl<'a> Renderer<'a> {
             || (required_offsets_bytes == 0 && self.grid_offsets_buffer.size() != 0)
         {
             // Recalculate required size (ensure non-zero)
-            let new_buffer_size = required_offsets_bytes.max(std::mem::size_of::<[u32; 2]>() as u64);
+            let new_buffer_size =
+                required_offsets_bytes.max(std::mem::size_of::<[u32; 2]>() as u64);
 
             log::info!(
                 "Resizing grid offsets buffer from {} to {} bytes (grid dims {}x{})",
-                self.grid_offsets_buffer.size(), new_buffer_size, grid_width, grid_height
+                self.grid_offsets_buffer.size(),
+                new_buffer_size,
+                grid_width,
+                grid_height
             );
 
             self.grid_offsets_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -433,10 +503,22 @@ impl<'a> Renderer<'a> {
                 label: Some("Storage Bind Group (Recreated)"),
                 layout: &self.bind_group_layout_storage,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.organism_storage_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.organism_count_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.grid_offsets_buffer.as_entire_binding() }, // Use potentially new buffer
-                    wgpu::BindGroupEntry { binding: 3, resource: self.grid_indices_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.organism_storage_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.organism_count_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.grid_offsets_buffer.as_entire_binding(),
+                    }, // Use potentially new buffer
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.grid_indices_buffer.as_entire_binding(),
+                    },
                 ],
             });
         }
@@ -445,27 +527,34 @@ impl<'a> Renderer<'a> {
         // Organism Data
         if current_organism_count > 0 {
             self.queue.write_buffer(
-                &self.organism_storage_buffer, 0, bytemuck::cast_slice(&gpu_data_for_buffer),
+                &self.organism_storage_buffer,
+                0,
+                bytemuck::cast_slice(&gpu_data_for_buffer),
             );
         }
         // Organism Count
         self.queue.write_buffer(
-            &self.organism_count_buffer, 0, bytemuck::cast_slice(&[current_organism_count as u32]),
+            &self.organism_count_buffer,
+            0,
+            bytemuck::cast_slice(&[current_organism_count as u32]),
         );
 
         // Grid Data
         if !gpu_grid_offsets.is_empty() && self.grid_offsets_buffer.size() > 0 {
             self.queue.write_buffer(
-                &self.grid_offsets_buffer, 0, bytemuck::cast_slice(gpu_grid_offsets),
+                &self.grid_offsets_buffer,
+                0,
+                bytemuck::cast_slice(gpu_grid_offsets),
             );
         }
         // Only write indices if count > 0 and buffer has size
         if !gpu_grid_indices.is_empty() && self.grid_indices_buffer.size() > 0 {
             self.queue.write_buffer(
-                &self.grid_indices_buffer, 0, bytemuck::cast_slice(gpu_grid_indices),
+                &self.grid_indices_buffer,
+                0,
+                bytemuck::cast_slice(gpu_grid_indices),
             );
         }
-
 
         // Global Uniforms (Update grid params)
         let grid_uniform_data = GridUniformUpdate {
@@ -477,24 +566,33 @@ impl<'a> Renderer<'a> {
             + std::mem::size_of::<f32>()     // smoothness
             + std::mem::size_of::<[f32; 4]>(); // background_color
         self.queue.write_buffer(
-            &self.global_uniform_buffer, grid_dims_offset as wgpu::BufferAddress,
+            &self.global_uniform_buffer,
+            grid_dims_offset as wgpu::BufferAddress,
             bytemuck::bytes_of(&grid_uniform_data),
         );
 
         // --- Create Command Encoder ---
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
 
         // --- Render Pass ---
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Metaball Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_surface_view, resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(BACKGROUND_COLOR), store: wgpu::StoreOp::Store },
+                    view: &output_surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BACKGROUND_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
